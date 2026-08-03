@@ -1,5 +1,3 @@
-# ubuntu_webchecker
-
 # Web Scoping Tool
 
 Web Scoping Tool is a Python-based application for checking the status of websites, optionally checking for the presence of Web Application Firewalls (WAF), and taking screenshots of websites. The application is built with PyQt5 for the GUI, Selenium for web automation, and requests for HTTP requests. It also generates an HTML report of the results and provides voice notifications using pyttsx3.
@@ -47,25 +45,16 @@ Before you begin, ensure you have the following installed on your Ubuntu system:
     pip install -r requirements.txt
     ```
 
-    Create a `requirements.txt` file with the following content:
-    ```plaintext
-    requests
-    selenium
-    PyQt5
-    qdarkstyle
-    pyttsx3
-    ```
-
 ## Usage
 
 1. **Run the application**:
     ```bash
-    python web_scoping_app.py
+    python ubuntu_webchecker.py
     ```
 
 2. **User Interface**:
     - **Enter URL or Select File**: Enter a single URL or click 'Browse' to select a text file containing multiple URLs.
-    - **Include WAF Check**: Check this option to enable Web Application Firewall checking.
+    - **Include WAF Check**: Check this option to enable Web Application Firewall checking. This sends a live test payload to each URL — only enable it against systems you're authorized to test.
     - **Run Web Check**: Click this button to start the web check process.
 
 ## Functionality
