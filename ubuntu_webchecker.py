@@ -26,9 +26,10 @@ from selenium.webdriver.chrome.options import Options
 
 from web_scoping_core import (
     CheckResult,
+    ScanOutcome,
     build_http_session,
     check_waf,
-    check_website_status,
+    collect_http_diagnostics,
     generate_html_report,
     normalize_url,
     open_report,
@@ -44,7 +45,7 @@ class ScanWorker(QObject):
     """Run blocking scan operations away from the GUI thread."""
 
     progress = pyqtSignal(int, int, str)
-    finished = pyqtSignal(object, bool)
+    finished = pyqtSignal(object)
     failed = pyqtSignal(str)
 
     def __init__(self, urls: list[str], waf_check_enabled: bool) -> None:
@@ -76,12 +77,12 @@ class ScanWorker(QObject):
                 self.urls,
                 waf_check_enabled=self.waf_check_enabled,
                 take_screenshot=take_screenshot,
-                status_checker=partial(check_website_status, client=http_session),
+                status_checker=partial(collect_http_diagnostics, client=http_session),
                 waf_checker=partial(check_waf, client=http_session),
                 should_cancel=self._cancel_requested.is_set,
                 on_progress=report_progress,
             )
-            self.finished.emit(outcome.results, outcome.cancelled)
+            self.finished.emit(outcome)
         except Exception as exc:
             self.failed.emit(str(exc))
         finally:
@@ -257,17 +258,23 @@ class WebScopingApp(QWidget):
     def update_progress(self, completed: int, total: int, url: str) -> None:
         self.label_progress.setText(f"Checked {completed}/{total}: {url}")
 
-    @pyqtSlot(object, bool)
-    def scan_finished(self, results: list[CheckResult], cancelled: bool) -> None:
-        if not results and cancelled:
+    @pyqtSlot(object)
+    def scan_finished(self, outcome: ScanOutcome) -> None:
+        if not outcome.results and outcome.cancelled:
             self.label_progress.setText("Scan cancelled before any targets completed.")
             return
 
-        report_path = generate_html_report(results, REPORT_FILE)
+        report_path = generate_html_report(
+            outcome.results,
+            REPORT_FILE,
+            scan_id=outcome.scan_id,
+            started_at=outcome.started_at,
+            completed_at=outcome.completed_at,
+        )
         open_report(report_path)
-        state = "cancelled" if cancelled else "completed"
+        state = "cancelled" if outcome.cancelled else "completed"
         self.label_progress.setText(
-            f"Scan {state}: {len(results)}/{len(self.urls)} target(s) reported."
+            f"Scan {state}: {len(outcome.results)}/{len(self.urls)} target(s) reported."
         )
         self.speak(f"Web check {state}!")
         print(f"Web check {state}. Report: {report_path.resolve()}")
