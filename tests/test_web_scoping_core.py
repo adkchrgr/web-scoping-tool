@@ -70,6 +70,31 @@ def test_status_check_handles_request_error() -> None:
     assert "offline" in error
 
 
+def test_http_session_has_bounded_get_retry_policy() -> None:
+    session = core.build_http_session(max_retries=3, backoff_factor=0.25)
+    try:
+        retry_policy = session.get_adapter("https://").max_retries
+
+        assert retry_policy.total == 3
+        assert retry_policy.backoff_factor == 0.25
+        assert retry_policy.allowed_methods == frozenset({"GET"})
+        assert retry_policy.status_forcelist == core.RETRYABLE_STATUS_CODES
+        assert retry_policy.respect_retry_after_header is True
+        assert retry_policy.raise_on_status is False
+    finally:
+        session.close()
+
+
+def test_http_session_rejects_invalid_retry_configuration() -> None:
+    for retries, backoff in [(-1, 0.5), (2, -0.1)]:
+        try:
+            core.build_http_session(max_retries=retries, backoff_factor=backoff)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("expected ValueError")
+
+
 def test_waf_probe_preserves_existing_query() -> None:
     probe = core.build_waf_probe_url("https://example.com/path?a=1")
 
