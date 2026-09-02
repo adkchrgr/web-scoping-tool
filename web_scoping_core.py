@@ -8,15 +8,23 @@ from __future__ import annotations
 
 import html
 import re
+import socket
+import time
 import webbrowser
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from uuid import uuid4
 
 import requests
 from requests.adapters import HTTPAdapter
+from urllib3.exceptions import NameResolutionError
+from urllib3.exceptions import SSLError as Urllib3SSLError
+from urllib3.exceptions import TimeoutError as Urllib3TimeoutError
 from urllib3.util.retry import Retry
 
 DEFAULT_TIMEOUT_SECONDS = 10
@@ -37,6 +45,32 @@ class HttpClient(Protocol):
     def get(self, url: str, **kwargs: Any) -> requests.Response: ...
 
 
+class ErrorCategory(StrEnum):
+    """Stable machine-readable categories for failed or unhealthy checks."""
+
+    TIMEOUT = "timeout"
+    DNS = "dns"
+    TLS = "tls"
+    CONNECTION = "connection"
+    HTTP = "http"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class HttpCheckResult:
+    """Structured diagnostics from one HTTP reachability check."""
+
+    is_up: bool
+    status_code: int | None
+    final_url: str | None
+    checked_at: str
+    duration_ms: float
+    redirect_count: int
+    retry_count: int | None
+    error_category: ErrorCategory | None = None
+    error: str | None = None
+
+
 @dataclass(frozen=True)
 class CheckResult:
     """One URL's collected results for HTML reporting."""
@@ -47,6 +81,12 @@ class CheckResult:
     screenshot_path: str | None
     waf_result: str
     error: str | None = None
+    final_url: str | None = None
+    checked_at: str | None = None
+    duration_ms: float | None = None
+    redirect_count: int = 0
+    retry_count: int | None = 0
+    error_category: ErrorCategory | None = None
 
 
 @dataclass(frozen=True)
@@ -55,12 +95,65 @@ class ScanOutcome:
 
     results: list[CheckResult]
     cancelled: bool
+    scan_id: str
+    started_at: str
+    completed_at: str
+    duration_ms: float
 
 
-StatusChecker = Callable[[str], tuple[bool, int | None, str | None]]
+StatusChecker = Callable[[str], HttpCheckResult]
 WafChecker = Callable[[str], str]
 ScreenshotTaker = Callable[[str], str]
 ProgressCallback = Callable[[int, int, CheckResult], None]
+
+
+def utc_timestamp(now: datetime | None = None) -> str:
+    """Return an ISO-8601 UTC timestamp with an explicit Z suffix."""
+    value = now or datetime.now(timezone.utc)
+    return value.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def create_scan_id() -> str:
+    """Create a compact identifier suitable for correlating logs and output."""
+    return uuid4().hex
+
+
+def _exception_chain(exc: BaseException) -> list[BaseException]:
+    """Collect nested exceptions without looping over cyclic exception graphs."""
+    found: list[BaseException] = []
+    pending = [exc]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        found.append(current)
+        pending.extend(arg for arg in current.args if isinstance(arg, BaseException))
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+    return found
+
+
+def categorize_request_error(exc: requests.RequestException) -> ErrorCategory:
+    """Map requests/urllib3 exception chains to a stable diagnostic category."""
+    chain = _exception_chain(exc)
+    if any(isinstance(item, (requests.Timeout, Urllib3TimeoutError)) for item in chain):
+        return ErrorCategory.TIMEOUT
+    if any(isinstance(item, (requests.exceptions.SSLError, Urllib3SSLError)) for item in chain):
+        return ErrorCategory.TLS
+    if any(isinstance(item, (NameResolutionError, socket.gaierror)) for item in chain):
+        return ErrorCategory.DNS
+    if any(isinstance(item, requests.ConnectionError) for item in chain):
+        return ErrorCategory.CONNECTION
+    return ErrorCategory.UNKNOWN
+
+
+def _response_retry_count(response: requests.Response) -> int:
+    retries = getattr(getattr(response, "raw", None), "retries", None)
+    return len(getattr(retries, "history", ()) or ())
 
 
 def build_http_session(
@@ -112,17 +205,19 @@ def normalize_url(value: str) -> str:
     return urlunsplit(parsed)
 
 
-def check_website_status(
+def collect_http_diagnostics(
     url: str,
     *,
     client: HttpClient = requests,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
-) -> tuple[bool, int | None, str | None]:
-    """Check reachability and return (is_up, status_code, error).
+) -> HttpCheckResult:
+    """Check reachability and return structured HTTP diagnostics.
 
     Any HTTP response means the host responded. 2xx/3xx are considered "up";
     4xx/5xx are considered reachable but unhealthy for this report.
     """
+    started = time.perf_counter()
+    checked_at = utc_timestamp()
     try:
         response = client.get(
             url,
@@ -131,10 +226,40 @@ def check_website_status(
             allow_redirects=True,
         )
     except requests.RequestException as exc:
-        return False, None, str(exc)
+        return HttpCheckResult(
+            is_up=False,
+            status_code=None,
+            final_url=None,
+            checked_at=checked_at,
+            duration_ms=round((time.perf_counter() - started) * 1000, 2),
+            redirect_count=0,
+            retry_count=None,
+            error_category=categorize_request_error(exc),
+            error=str(exc),
+        )
 
     is_up = 200 <= response.status_code < 400
-    return is_up, response.status_code, None
+    return HttpCheckResult(
+        is_up=is_up,
+        status_code=response.status_code,
+        final_url=getattr(response, "url", None) or url,
+        checked_at=checked_at,
+        duration_ms=round((time.perf_counter() - started) * 1000, 2),
+        redirect_count=len(getattr(response, "history", ()) or ()),
+        retry_count=_response_retry_count(response),
+        error_category=None if is_up else ErrorCategory.HTTP,
+    )
+
+
+def check_website_status(
+    url: str,
+    *,
+    client: HttpClient = requests,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+) -> tuple[bool, int | None, str | None]:
+    """Backward-compatible reachability result: (is_up, status_code, error)."""
+    result = collect_http_diagnostics(url, client=client, timeout=timeout)
+    return result.is_up, result.status_code, result.error
 
 
 def build_waf_probe_url(url: str) -> str:
@@ -191,10 +316,13 @@ def scan_urls(
     *,
     waf_check_enabled: bool,
     take_screenshot: ScreenshotTaker | None = None,
-    status_checker: StatusChecker = check_website_status,
+    status_checker: StatusChecker = collect_http_diagnostics,
     waf_checker: WafChecker = check_waf,
     should_cancel: Callable[[], bool] = lambda: False,
     on_progress: ProgressCallback | None = None,
+    scan_id: str | None = None,
+    wall_clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+    monotonic: Callable[[], float] = time.perf_counter,
 ) -> ScanOutcome:
     """Scan URLs sequentially with observable progress and cooperative cancellation.
 
@@ -204,21 +332,35 @@ def scan_urls(
     """
     results: list[CheckResult] = []
     total = len(urls)
+    resolved_scan_id = scan_id or create_scan_id()
+    started_at = utc_timestamp(wall_clock())
+    started = monotonic()
+
+    def finish(*, cancelled: bool) -> ScanOutcome:
+        return ScanOutcome(
+            results=results,
+            cancelled=cancelled,
+            scan_id=resolved_scan_id,
+            started_at=started_at,
+            completed_at=utc_timestamp(wall_clock()),
+            duration_ms=round((monotonic() - started) * 1000, 2),
+        )
 
     for url in urls:
         if should_cancel():
-            return ScanOutcome(results=results, cancelled=True)
+            return finish(cancelled=True)
 
-        is_up, status_code, error = status_checker(url)
+        status = status_checker(url)
         if should_cancel():
-            return ScanOutcome(results=results, cancelled=True)
+            return finish(cancelled=True)
 
         waf_result = waf_checker(url) if waf_check_enabled else "WAF check disabled."
         if should_cancel():
-            return ScanOutcome(results=results, cancelled=True)
+            return finish(cancelled=True)
 
         screenshot_path: str | None = None
-        if is_up and take_screenshot is not None:
+        error = status.error
+        if status.is_up and take_screenshot is not None:
             try:
                 screenshot_path = take_screenshot(url)
             except Exception as exc:
@@ -227,20 +369,33 @@ def scan_urls(
 
         result = CheckResult(
             url=url,
-            is_up=is_up,
-            status_code=status_code,
+            is_up=status.is_up,
+            status_code=status.status_code,
             screenshot_path=screenshot_path,
             waf_result=waf_result,
             error=error,
+            final_url=status.final_url,
+            checked_at=status.checked_at,
+            duration_ms=status.duration_ms,
+            redirect_count=status.redirect_count,
+            retry_count=status.retry_count,
+            error_category=status.error_category,
         )
         results.append(result)
         if on_progress is not None:
             on_progress(len(results), total, result)
 
-    return ScanOutcome(results=results, cancelled=False)
+    return finish(cancelled=False)
 
 
-def generate_html_report(results: list[CheckResult], output_file: str | Path) -> Path:
+def generate_html_report(
+    results: list[CheckResult],
+    output_file: str | Path,
+    *,
+    scan_id: str | None = None,
+    started_at: str | None = None,
+    completed_at: str | None = None,
+) -> Path:
     """Generate an escaped standalone HTML report and return its path."""
     output_path = Path(output_file)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -262,6 +417,23 @@ def generate_html_report(results: list[CheckResult], output_file: str | Path) ->
             ),
             f"<p>WAF check: {html.escape(result.waf_result)}</p>",
         ]
+        diagnostics = []
+        if result.duration_ms is not None:
+            diagnostics.append(f"{result.duration_ms:.2f} ms")
+        diagnostics.append(f"{result.redirect_count} redirect(s)")
+        retry_text = (
+            "retry count unavailable"
+            if result.retry_count is None
+            else f"{result.retry_count} retry/retries"
+        )
+        diagnostics.append(retry_text)
+        row.append(f"<p>Diagnostics: {', '.join(diagnostics)}</p>")
+        if result.checked_at:
+            row.append(f"<p>Checked: {html.escape(result.checked_at)}</p>")
+        if result.final_url and result.final_url != result.url:
+            row.append(f"<p>Final URL: {html.escape(result.final_url)}</p>")
+        if result.error_category:
+            row.append(f"<p>Error category: {html.escape(result.error_category.value)}</p>")
         if result.error:
             row.append(f"<p>Error: {html.escape(result.error)}</p>")
         if result.screenshot_path:
@@ -291,6 +463,9 @@ def generate_html_report(results: list[CheckResult], output_file: str | Path) ->
 </head>
 <body>
     <h1>Web Check Report</h1>
+    {f'<p>Scan ID: {html.escape(scan_id)}</p>' if scan_id else ''}
+    {f'<p>Started: {html.escape(started_at)}</p>' if started_at else ''}
+    {f'<p>Completed: {html.escape(completed_at)}</p>' if completed_at else ''}
     {''.join(rows)}
 </body>
 </html>
