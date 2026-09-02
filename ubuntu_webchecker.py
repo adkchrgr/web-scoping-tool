@@ -1,253 +1,213 @@
-import os
-import requests
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service as ChromeService
-from selenium.webdriver.chrome.options import Options
-from PyQt5.QtWidgets import QApplication, QWidget, QLabel, QLineEdit, QPushButton, QVBoxLayout, QFileDialog, QCheckBox
-from PyQt5.QtGui import QFont
-from PyQt5.QtCore import Qt
-import qdarkstyle
-from datetime import datetime
+"""PyQt front end for Web Scoping Tool."""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
 import pyttsx3
+import qdarkstyle
+from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QFont
+from PyQt5.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QFileDialog,
+    QLabel,
+    QLineEdit,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
 
-# Define a class for the Web Scoping application
+from web_scoping_core import (
+    CheckResult,
+    check_waf,
+    check_website_status,
+    generate_html_report,
+    normalize_url,
+    open_report,
+    url_to_filename,
+)
+
+SCREENSHOT_DIRECTORY = Path("screenshots")
+REPORT_FILE = Path("web_check_report.html")
+
+
 class WebScopingApp(QWidget):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
-
-        # List to store URLs
-        self.urls = []
-
-        # Initialize the user interface
+        self.urls: list[str] = []
         self.init_ui()
 
-    def init_ui(self):
-        # Set window properties
-        self.setWindowTitle('Web Checking Tool')
+    def init_ui(self) -> None:
+        self.setWindowTitle("Web Checking Tool")
         self.setGeometry(100, 100, 500, 350)
 
-        # Define fonts
-        font_heading = QFont('Helvetica', 16)
-        font_label = QFont('Helvetica', 12)
+        heading_font = QFont("Helvetica", 16)
+        label_font = QFont("Helvetica", 12)
 
-        # Heading label
-        self.label_heading = QLabel('Web Checking Tool')
-        self.label_heading.setFont(font_heading)
+        self.label_heading = QLabel("Web Checking Tool")
+        self.label_heading.setFont(heading_font)
         self.label_heading.setAlignment(Qt.AlignCenter)
 
-        # Description label
-        self.label_description = QLabel('Enter a URL or select a file containing URLs. Optionally, enable the WAF check.')
-        self.label_description.setFont(font_label)
+        self.label_description = QLabel(
+            "Enter a URL or select a file containing URLs. "
+            "Optionally, enable the WAF heuristic check."
+        )
+        self.label_description.setFont(label_font)
         self.label_description.setWordWrap(True)
 
-        # URL-related components
-        self.label_url = QLabel('Enter URL or Select File:')
-        self.label_url.setFont(font_label)
+        self.label_url = QLabel("Enter URL or Select File:")
+        self.label_url.setFont(label_font)
 
         self.entry_url = QLineEdit(self)
-        self.entry_url.setFont(font_label)
+        self.entry_url.setFont(label_font)
 
-        self.button_browse = QPushButton('Browse', self)
-        self.button_browse.setFont(font_label)
+        self.button_browse = QPushButton("Browse", self)
+        self.button_browse.setFont(label_font)
         self.button_browse.clicked.connect(self.browse_file)
 
-        # WAF check toggle
-        self.waf_check_toggle = QCheckBox('Include WAF Check', self)
-        self.waf_check_toggle.setFont(font_label)
+        self.waf_check_toggle = QCheckBox("Include WAF Check", self)
+        self.waf_check_toggle.setFont(label_font)
 
-        # Run button
-        self.button_run_scoping = QPushButton('Run Web Check', self)
-        self.button_run_scoping.setFont(font_label)
+        self.button_run_scoping = QPushButton("Run Web Check", self)
+        self.button_run_scoping.setFont(label_font)
         self.button_run_scoping.clicked.connect(self.run_web_scoping)
 
-        # Layout with increased margins
         layout = QVBoxLayout(self)
         layout.addWidget(self.label_heading)
         layout.addWidget(self.label_description)
-        layout.addSpacing(20)  # Increase spacing
+        layout.addSpacing(20)
         layout.addWidget(self.label_url)
         layout.addWidget(self.entry_url)
         layout.addWidget(self.button_browse)
         layout.addWidget(self.waf_check_toggle)
         layout.addWidget(self.button_run_scoping)
-        layout.addSpacing(20)  # Increase spacing
+        layout.addSpacing(20)
 
-        # Apply QDarkStyle
         self.setStyleSheet(qdarkstyle.load_stylesheet_pyqt5())
 
-    def browse_file(self):
-        # Function to open file dialog and set the selected file path to the entry field
-        file_dialog = QFileDialog()
-        file_path, _ = file_dialog.getOpenFileName(self, 'Select File', '/', 'Text files (*.txt);;All files (*)')
-        self.entry_url.setText(file_path)
+    def browse_file(self) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select File",
+            str(Path.home()),
+            "Text files (*.txt);;All files (*)",
+        )
+        if file_path:
+            self.entry_url.setText(file_path)
 
-    def take_screenshot(self, url, output_directory, chromedriver_path):
-        # Function to take a screenshot of a website
+    @staticmethod
+    def load_urls(value: str) -> list[str]:
+        candidate = Path(value).expanduser()
+        if candidate.is_file():
+            raw_urls = candidate.read_text(encoding="utf-8").splitlines()
+        else:
+            raw_urls = [value]
+
+        urls: list[str] = []
+        for raw_url in raw_urls:
+            if not raw_url.strip():
+                continue
+            urls.append(normalize_url(raw_url))
+
+        if not urls:
+            raise ValueError("No valid URLs were supplied")
+        return urls
+
+    @staticmethod
+    def create_browser() -> webdriver.Chrome:
         options = Options()
-        options.add_argument("--headless")
+        options.add_argument("--headless=new")
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--window-size=1440,1200")
+        return webdriver.Chrome(options=options)
 
-        driver_service = ChromeService(executable_path=chromedriver_path)
-        driver = webdriver.Chrome(service=driver_service, options=options)
+    @staticmethod
+    def take_screenshot(
+        driver: webdriver.Chrome,
+        url: str,
+        output_directory: Path,
+    ) -> str:
+        driver.get(url)
+        screenshot_path = output_directory / f"{url_to_filename(url)}.png"
+        driver.save_screenshot(str(screenshot_path))
+        return str(screenshot_path)
+
+    @staticmethod
+    def speak(message: str) -> None:
         try:
-            driver.get(url)
-            screenshot_path = os.path.join(output_directory, f"{self.url_to_filename(url)}.png")
-            driver.save_screenshot(screenshot_path)
-            return screenshot_path
-        finally:
-            driver.quit()
+            engine = pyttsx3.init()
+            engine.say(message)
+            engine.runAndWait()
+        except Exception as exc:  # Audio is optional; do not fail a scan over it.
+            print(f"Voice notification unavailable: {exc}")
 
-    def check_website_status(self, url):
-        # Function to check if a website is up (status code 200)
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
-
+    def run_web_scoping(self) -> None:
         try:
-            response = requests.get(url, headers=headers)
-            return response.status_code == 200
-        except requests.ConnectionError:
-            return False
+            self.urls = self.load_urls(self.entry_url.text())
+        except (OSError, ValueError) as exc:
+            print(f"Input error: {exc}")
+            return
 
-    def check_waf(self, url):
-        # Function to check for the presence of a Web Application Firewall (WAF)
-        payload = "/?test=%3Cscript%3Ealert(1)%3C/script%3E"  # Modify this based on your specific payload
-        full_url = url + payload
-        response = requests.get(full_url)
-
-        if response.status_code == 403:
-            return "<span style='color: red;'>A Web Application Firewall (WAF) is likely present and blocking access (403 Forbidden).</span>"
-        elif response.ok:
-            return "<span style='color: green;'>A Web Application Firewall (WAF) may be present but is not being detected.</span>"
-        else:
-            return "Unexpected response. Further inspection may be needed."
-
-    def url_to_filename(self, url):
-        # Function to convert a URL to a valid filename
-        return "".join(c if c.isalnum() else "_" for c in url)
-
-    def generate_html_report(self, results, output_file):
-        # Function to generate an HTML report based on the results
-        with open(output_file, "w") as file:
-            file.write(
-                """
-                <!DOCTYPE html>
-                <html>
-                <head>
-                    <title>Web Check Report</title>
-                    <style>
-                        body {
-                            font-family: 'Helvetica', sans-serif;
-                            max-width: 800px;
-                            margin: 0 auto;
-                            padding: 20px;
-                            background-color: #36454F;  /* Charcoal Grey background */
-                            color: white;  /* white text */
-                        }
-                        h1 {
-                            text-align: center;
-                        }
-                        h2 {
-                            border-bottom: 1px solid #ddd;
-                            padding-bottom: 5px;
-                            margin-top: 20px;
-                        }
-                        p {
-                            margin: 0;
-                        }
-                        .up {
-                            color: green;
-                        }
-                        .down {
-                            color: red;
-                        }
-                        img {
-                            max-width: 100%;
-                            height: auto;
-                            margin-top: 10px;
-                        }
-                    </style>
-                </head>
-                <body>
-                    <h1>Web Check Report</h1>
-                """
-            )
-
-            for url, status, screenshot_path, waf_result in results:
-                file.write(f"<h2>{url}</h2>")
-                status_text = 'Up' if status else 'Down'
-                status_class = 'up' if status else 'down'
-                file.write(f"<p>Status: <span class='{status_class}'>{status_text}</span></p>")
-                file.write(f"<p>WAF Check: {waf_result}</p>")
-                if status:
-                    file.write(f'<img src="{screenshot_path}" alt="Screenshot"/>')
-                else:
-                    file.write("<p>No screenshot available</p>")
-
-            file.write("</body></html>")
-
-    def speak_start_message(self):
-        # Function to speak a starting message
-        engine = pyttsx3.init()
-        engine.say("Web check starting! Please wait.")
-        engine.runAndWait()
-
-    def speak_completed_message(self):
-        # Function to speak a completion message
-        engine = pyttsx3.init()
-        engine.say("Web check completed!")
-        engine.runAndWait()
-
-    def run_web_scoping(self):
-        # Function to run the web scoping checks
-        url_or_file = self.entry_url.text()
-
-        if os.path.isfile(url_or_file):
-            with open(url_or_file, 'r') as file:
-                self.urls = file.read().splitlines()
-        else:
-            self.urls = [url_or_file]
-
-        output_directory = "screenshots"
-        report_file = "web_check_report.html"
-
-        chromedriver_path = "/usr/bin/chromedriver"  # Updated for Ubuntu
-
-        if not os.path.exists(output_directory):
-            os.makedirs(output_directory)
-
-        results = []
-
-        # Get the value of the WAF check toggle
+        SCREENSHOT_DIRECTORY.mkdir(parents=True, exist_ok=True)
         waf_check_enabled = self.waf_check_toggle.isChecked()
+        results: list[CheckResult] = []
+        browser: webdriver.Chrome | None = None
 
-        self.speak_start_message()
+        self.speak("Web check starting! Please wait.")
 
-        for url in self.urls:
-            status = self.check_website_status(url)
+        try:
+            for url in self.urls:
+                is_up, status_code, error = check_website_status(url)
+                waf_result = check_waf(url) if waf_check_enabled else "WAF check disabled."
+                screenshot_path: str | None = None
 
-            if waf_check_enabled:
-                waf_result = self.check_waf(url)
-            else:
-                waf_result = "WAF check disabled."
+                if is_up:
+                    try:
+                        if browser is None:
+                            browser = self.create_browser()
+                        screenshot_path = self.take_screenshot(
+                            browser,
+                            url,
+                            SCREENSHOT_DIRECTORY,
+                        )
+                    except Exception as exc:
+                        screenshot_path = None
+                        screenshot_error = f"Screenshot failed: {exc}"
+                        error = f"{error}; {screenshot_error}" if error else screenshot_error
 
-            if status:
-                screenshot_path = self.take_screenshot(url, output_directory, chromedriver_path)
-            else:
-                screenshot_path = None
+                results.append(
+                    CheckResult(
+                        url=url,
+                        is_up=is_up,
+                        status_code=status_code,
+                        screenshot_path=screenshot_path,
+                        waf_result=waf_result,
+                        error=error,
+                    )
+                )
+        finally:
+            if browser is not None:
+                browser.quit()
 
-            results.append((url, status, screenshot_path, waf_result))
+        report_path = generate_html_report(results, REPORT_FILE)
+        open_report(report_path)
+        self.speak("Web check completed!")
+        print(f"Web check completed. Report: {report_path.resolve()}")
 
-        self.generate_html_report(results, report_file)
-        os.system(f'xdg-open {report_file}')  # Open the report in default browser on Ubuntu
 
-        self.speak_completed_message()
-
-        print("Web check completed!")
-
-# Main entry point
-if __name__ == '__main__':
-    app = QApplication([])
+def main() -> int:
+    app = QApplication(sys.argv)
     app.setStyleSheet(qdarkstyle.load_stylesheet_pyqt5())
     window = WebScopingApp()
     window.show()
-    app.exec_()
+    return app.exec_()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
