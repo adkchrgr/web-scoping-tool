@@ -20,6 +20,7 @@ The project is split into a testable core module (`web_scoping_core.py`) and a P
 - Open the report using the platform default browser without shell execution.
 - Optional voice notifications.
 - Run headlessly with machine-readable JSON and meaningful exit codes.
+- Correlate scans with IDs, timestamps, timings, redirect/retry counts, and error categories.
 
 > **Authorized use only:** Run active checks only against systems you own or have explicit permission to test.
 
@@ -89,6 +90,18 @@ Exit codes are suitable for scripts and CI:
 
 Use `--help` to see timeout, retry, and backoff controls.
 
+Add `--verbose` to emit newline-delimited JSON diagnostic events to `stderr` while keeping
+the result document on `stdout` clean for downstream automation:
+
+```bash
+python web_scoping_cli.py example.com --verbose > results.json 2> diagnostics.jsonl
+```
+
+Every result includes the requested and final URL, check timestamp, response duration,
+redirect count, retry count, and a stable error category when applicable. Categories are
+`timeout`, `dns`, `tls`, `connection`, `http`, and `unknown`. The top-level scan metadata
+contains a correlation ID plus start, completion, and total-duration values.
+
 ## WAF Check
 
 The optional WAF check appends an XSS-shaped query value and observes the HTTP response.
@@ -121,6 +134,7 @@ The tests exercise browser-independent behavior including:
 - HTML escaping in generated reports
 - scan orchestration, progress callbacks, cancellation, and screenshot failures
 - CLI JSON output, session reuse, and exit-code behavior
+- diagnostic timings, correlation metadata, failure categories, and structured log routing
 
 The tests do not make live network requests.
 
@@ -156,6 +170,7 @@ The original project was a useful single-file prototype. The current version add
 - background execution with observable progress and cooperative cancellation
 - pooled HTTP sessions with bounded transient retries and `Retry-After` support
 - a headless JSON CLI with automation-friendly exit codes
+- structured diagnostics suitable for debugging and engineering handoffs
 
 ## Known Limitations
 
