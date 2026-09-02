@@ -13,7 +13,11 @@ class FakeResponse:
 
 
 class FakeClient:
-    def __init__(self, response: FakeResponse | None = None, error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        response: FakeResponse | None = None,
+        error: Exception | None = None,
+    ) -> None:
         self.response = response
         self.error = error
         self.calls: list[tuple[str, dict]] = []
