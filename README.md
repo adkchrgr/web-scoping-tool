@@ -1,62 +1,51 @@
 # Web Scoping Tool
 
-A Python desktop utility for authorized web-scope validation. It can check website availability, take browser screenshots, run an optional WAF heuristic, and generate an HTML report from the results.
+![CI](https://github.com/adkchrgr/web-scoping-tool/actions/workflows/ci.yml/badge.svg)
 
-I built this as a practical automation project around a workflow I was familiar with: taking a list of web targets, checking basic reachability and behavior, and collecting consistent evidence without doing every step manually.
+Web Scoping Tool is a Python/PyQt utility for authorized web-scope validation. It checks HTTP reachability, can run an optional heuristic WAF probe, captures screenshots with Selenium, and generates an HTML report.
 
-## What It Demonstrates
-
-- Python application structure
-- HTTP requests and response handling
-- Selenium browser automation
-- PyQt5 desktop UI development
-- Batch processing from user input or a file
-- HTML report generation
-- Security-oriented workflow automation
+The project is split into a testable core module (`web_scoping_core.py`) and a PyQt front end (`ubuntu_webchecker.py`). This keeps HTTP and reporting logic independently testable without launching a GUI or browser in CI.
 
 ## Features
 
 - Enter a single URL or load multiple URLs from a text file.
-- Check basic website availability.
-- Optionally run a simple WAF-blocking heuristic.
-- Capture website screenshots with Selenium.
-- Generate an HTML report summarizing results.
-- Voice notifications for start and completion.
-- Dark-mode UI with QDarkStyle.
+- Normalize bare hostnames to HTTPS.
+- Check HTTP reachability with explicit timeouts and redirect handling.
+- Optionally run a simple WAF heuristic probe.
+- Reuse a single Selenium browser session for screenshots.
+- Generate an escaped HTML report.
+- Open the report using the platform default browser without shell execution.
+- Optional voice notifications.
 
-> **Authorized use only:** the optional WAF check sends a live test request to the supplied target. Use it only against systems you own or are explicitly authorized to test.
+> **Authorized use only:** Run active checks only against systems you own or have explicit permission to test.
 
-## High-Level Flow
+## Architecture
 
 ```text
-URL or file input
-      ↓
-HTTP availability check
-      ↓
-Optional WAF heuristic
-      ↓
-Selenium screenshot
-      ↓
-Structured result collection
-      ↓
-HTML report
+ubuntu_webchecker.py
+        |
+        +--> web_scoping_core.py
+                |-- URL normalization
+                |-- HTTP status checks
+                |-- WAF heuristic probe
+                |-- report generation
+                +-- report opening
+        |
+        +--> Selenium screenshot capture
+        +--> PyQt UI
 ```
-
-## Prerequisites
-
-- Python 3.7+
-- Google Chrome
-- ChromeDriver
 
 ## Installation
 
 ```bash
 git clone https://github.com/adkchrgr/web-scoping-tool.git
 cd web-scoping-tool
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-The current implementation expects ChromeDriver at `/usr/bin/chromedriver` on Ubuntu.
+Modern Selenium versions can use Selenium Manager to locate or provision a compatible browser driver, so the application no longer hardcodes `/usr/bin/chromedriver`.
 
 ## Usage
 
@@ -64,39 +53,82 @@ The current implementation expects ChromeDriver at `/usr/bin/chromedriver` on Ub
 python ubuntu_webchecker.py
 ```
 
-In the UI:
+Enter either:
 
-1. Enter one URL or select a text file containing URLs.
-2. Enable **Include WAF Check** only if authorized.
-3. Select **Run Web Check**.
-4. Review the generated HTML report and screenshots.
+- a URL such as `https://example.com`
+- a bare hostname such as `example.com`
+- a text file containing one target per line
 
-## WAF Check Limitation
+The generated report is written to `web_check_report.html`, and screenshots are stored under `screenshots/`.
 
-The WAF option is deliberately described as a **heuristic**, not a definitive detector. A blocking response such as HTTP 403 can be consistent with a WAF, but it can also result from application logic, authentication, rate limiting, CDN behavior, or other controls.
+## WAF Check
 
-The result should therefore be treated as a signal for further investigation rather than a positive identification.
+The optional WAF check appends an XSS-shaped query value and observes the HTTP response.
 
-## Current Limitations
+A `403` or `406` is treated as evidence that filtering may be occurring. A successful response does **not** prove that no WAF is present. This is intentionally described as a heuristic rather than a WAF fingerprinting engine.
 
-- ChromeDriver path is hardcoded for the environment where I originally built the tool.
-- Network requests do not yet use consistent timeout/retry handling.
-- Browser sessions are created per target rather than reused.
-- UI, networking, and reporting logic currently live in one module.
-- The project does not yet include automated tests or CI.
+## Tests
 
-## What I Would Change for Production
+Install development dependencies:
 
-- Add request timeouts and broader exception handling.
-- Use Selenium Manager instead of a hardcoded driver path.
-- Reuse browser sessions where appropriate.
-- Separate UI, network, browser, and reporting concerns into modules.
-- Escape all dynamic values included in generated HTML.
-- Add structured logging.
-- Add unit tests with mocked HTTP responses.
-- Add integration tests for report generation.
-- Add linting and GitHub Actions CI.
-- Add a dry-run or non-invasive mode for workflows where active checks are not appropriate.
+```bash
+pip install -r requirements-dev.txt
+```
+
+Run the unit tests:
+
+```bash
+pytest -v
+```
+
+The tests exercise browser-independent behavior including:
+
+- URL normalization
+- request timeouts and network failures
+- redirect handling
+- WAF probe URL construction
+- WAF response interpretation
+- safe filename generation
+- HTML escaping in generated reports
+
+The tests do not make live network requests.
+
+## Linting
+
+```bash
+ruff check .
+```
+
+Ruff checks the repository for common correctness, import, and code-quality problems.
+
+## Continuous Integration
+
+GitHub Actions runs both Ruff and pytest automatically on every push and pull request.
+
+A green **CI passing** badge means the latest commit passed the automated checks. A red badge means the workflow completed with a failure that should be investigated in the repository's **Actions** tab.
+
+## Production-Minded Improvements in This Refactor
+
+The original project was a useful single-file prototype. The current version adds several engineering safeguards:
+
+- explicit HTTP timeouts
+- broader `requests.RequestException` handling
+- URL construction with `urllib.parse` instead of string concatenation
+- escaped untrusted values in HTML reports
+- portable report opening via `webbrowser` rather than `os.system`
+- Selenium Manager rather than a hardcoded ChromeDriver path
+- one reusable browser session instead of a new driver per URL
+- isolated browser-independent core logic
+- typed result objects
+- automated unit tests
+- linting and CI
+
+## Known Limitations
+
+- The PyQt scan loop is still synchronous, so large target lists can temporarily block the UI. A production version should move work to worker threads or an async/background task layer.
+- The WAF check is heuristic and does not identify specific WAF vendors.
+- Screenshot behavior still depends on a compatible local Chrome/Chromium installation.
+- HTTP reachability is intentionally simple and is not a full application-health assessment.
 
 ## License
 
