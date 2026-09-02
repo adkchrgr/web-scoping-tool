@@ -9,14 +9,20 @@ from __future__ import annotations
 import html
 import re
 import webbrowser
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 DEFAULT_TIMEOUT_SECONDS = 10
+DEFAULT_MAX_RETRIES = 2
+DEFAULT_BACKOFF_FACTOR = 0.5
+RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -41,6 +47,50 @@ class CheckResult:
     screenshot_path: str | None
     waf_result: str
     error: str | None = None
+
+
+@dataclass(frozen=True)
+class ScanOutcome:
+    """Results from a scan, including whether it ended early by cancellation."""
+
+    results: list[CheckResult]
+    cancelled: bool
+
+
+StatusChecker = Callable[[str], tuple[bool, int | None, str | None]]
+WafChecker = Callable[[str], str]
+ScreenshotTaker = Callable[[str], str]
+ProgressCallback = Callable[[int, int, CheckResult], None]
+
+
+def build_http_session(
+    *,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    backoff_factor: float = DEFAULT_BACKOFF_FACTOR,
+) -> requests.Session:
+    """Create a pooled session with bounded retries for transient GET failures."""
+    if max_retries < 0:
+        raise ValueError("max_retries cannot be negative")
+    if backoff_factor < 0:
+        raise ValueError("backoff_factor cannot be negative")
+
+    retry_policy = Retry(
+        total=max_retries,
+        connect=max_retries,
+        read=max_retries,
+        status=max_retries,
+        allowed_methods=frozenset({"GET"}),
+        status_forcelist=RETRYABLE_STATUS_CODES,
+        backoff_factor=backoff_factor,
+        respect_retry_after_header=True,
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry_policy)
+    session = requests.Session()
+    session.headers.update({"User-Agent": DEFAULT_USER_AGENT})
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
 
 
 def normalize_url(value: str) -> str:
@@ -134,6 +184,60 @@ def url_to_filename(url: str, *, max_length: int = 120) -> str:
     """Convert a URL to a filesystem-friendly deterministic filename stem."""
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", url).strip("._")
     return (cleaned or "site")[:max_length]
+
+
+def scan_urls(
+    urls: Sequence[str],
+    *,
+    waf_check_enabled: bool,
+    take_screenshot: ScreenshotTaker | None = None,
+    status_checker: StatusChecker = check_website_status,
+    waf_checker: WafChecker = check_waf,
+    should_cancel: Callable[[], bool] = lambda: False,
+    on_progress: ProgressCallback | None = None,
+) -> ScanOutcome:
+    """Scan URLs sequentially with observable progress and cooperative cancellation.
+
+    Dependencies are injected so orchestration can be tested without network or browser
+    access. Cancellation is checked between expensive stages; an in-flight network or
+    browser operation is allowed to finish before the scan stops.
+    """
+    results: list[CheckResult] = []
+    total = len(urls)
+
+    for url in urls:
+        if should_cancel():
+            return ScanOutcome(results=results, cancelled=True)
+
+        is_up, status_code, error = status_checker(url)
+        if should_cancel():
+            return ScanOutcome(results=results, cancelled=True)
+
+        waf_result = waf_checker(url) if waf_check_enabled else "WAF check disabled."
+        if should_cancel():
+            return ScanOutcome(results=results, cancelled=True)
+
+        screenshot_path: str | None = None
+        if is_up and take_screenshot is not None:
+            try:
+                screenshot_path = take_screenshot(url)
+            except Exception as exc:
+                screenshot_error = f"Screenshot failed: {exc}"
+                error = f"{error}; {screenshot_error}" if error else screenshot_error
+
+        result = CheckResult(
+            url=url,
+            is_up=is_up,
+            status_code=status_code,
+            screenshot_path=screenshot_path,
+            waf_result=waf_result,
+            error=error,
+        )
+        results.append(result)
+        if on_progress is not None:
+            on_progress(len(results), total, result)
+
+    return ScanOutcome(results=results, cancelled=False)
 
 
 def generate_html_report(results: list[CheckResult], output_file: str | Path) -> Path:

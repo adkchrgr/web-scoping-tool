@@ -70,6 +70,31 @@ def test_status_check_handles_request_error() -> None:
     assert "offline" in error
 
 
+def test_http_session_has_bounded_get_retry_policy() -> None:
+    session = core.build_http_session(max_retries=3, backoff_factor=0.25)
+    try:
+        retry_policy = session.get_adapter("https://").max_retries
+
+        assert retry_policy.total == 3
+        assert retry_policy.backoff_factor == 0.25
+        assert retry_policy.allowed_methods == frozenset({"GET"})
+        assert retry_policy.status_forcelist == core.RETRYABLE_STATUS_CODES
+        assert retry_policy.respect_retry_after_header is True
+        assert retry_policy.raise_on_status is False
+    finally:
+        session.close()
+
+
+def test_http_session_rejects_invalid_retry_configuration() -> None:
+    for retries, backoff in [(-1, 0.5), (2, -0.1)]:
+        try:
+            core.build_http_session(max_retries=retries, backoff_factor=backoff)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("expected ValueError")
+
+
 def test_waf_probe_preserves_existing_query() -> None:
     probe = core.build_waf_probe_url("https://example.com/path?a=1")
 
@@ -123,3 +148,91 @@ def test_report_escapes_untrusted_values(tmp_path: Path) -> None:
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in document
     assert "&lt;b&gt;unsafe&lt;/b&gt;" in document
     assert "bad &lt;input&gt;" in document
+
+
+def test_scan_urls_reports_progress_and_collects_results() -> None:
+    progress: list[tuple[int, int, str]] = []
+    screenshots: list[str] = []
+
+    def status_checker(url: str) -> tuple[bool, int | None, str | None]:
+        return True, 200, None
+
+    def take_screenshot(url: str) -> str:
+        screenshots.append(url)
+        return f"screenshots/{url.removeprefix('https://')}.png"
+
+    outcome = core.scan_urls(
+        ["https://one.example", "https://two.example"],
+        waf_check_enabled=False,
+        status_checker=status_checker,
+        take_screenshot=take_screenshot,
+        on_progress=lambda completed, total, result: progress.append(
+            (completed, total, result.url)
+        ),
+    )
+
+    assert outcome.cancelled is False
+    assert len(outcome.results) == 2
+    assert screenshots == ["https://one.example", "https://two.example"]
+    assert progress == [
+        (1, 2, "https://one.example"),
+        (2, 2, "https://two.example"),
+    ]
+    assert all(result.waf_result == "WAF check disabled." for result in outcome.results)
+
+
+def test_scan_urls_stops_before_next_target_when_cancelled() -> None:
+    calls: list[str] = []
+    cancelled = False
+
+    def status_checker(url: str) -> tuple[bool, int | None, str | None]:
+        nonlocal cancelled
+        calls.append(url)
+        cancelled = True
+        return True, 200, None
+
+    outcome = core.scan_urls(
+        ["https://one.example", "https://two.example"],
+        waf_check_enabled=False,
+        status_checker=status_checker,
+        take_screenshot=lambda url: f"{url}.png",
+        should_cancel=lambda: cancelled,
+    )
+
+    assert outcome.cancelled is True
+    assert outcome.results == []
+    assert calls == ["https://one.example"]
+
+
+def test_scan_urls_keeps_result_when_screenshot_fails() -> None:
+    def failing_screenshot(url: str) -> str:
+        raise RuntimeError(f"browser unavailable for {url}")
+
+    outcome = core.scan_urls(
+        ["https://example.com"],
+        waf_check_enabled=True,
+        status_checker=lambda url: (True, 200, None),
+        waf_checker=lambda url: "Filtering unlikely.",
+        take_screenshot=failing_screenshot,
+    )
+
+    result = outcome.results[0]
+    assert result.screenshot_path is None
+    assert result.waf_result == "Filtering unlikely."
+    assert result.error is not None
+    assert "Screenshot failed" in result.error
+
+
+def test_scan_urls_skips_screenshot_for_unhealthy_target() -> None:
+    screenshot_calls: list[str] = []
+
+    outcome = core.scan_urls(
+        ["https://example.com"],
+        waf_check_enabled=False,
+        status_checker=lambda url: (False, 503, None),
+        take_screenshot=lambda url: screenshot_calls.append(url) or "unused.png",
+    )
+
+    assert screenshot_calls == []
+    assert outcome.results[0].status_code == 503
+    assert outcome.results[0].screenshot_path is None
