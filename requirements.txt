@@ -1,4 +1,5 @@
 requests>=2.31
+urllib3>=2.2,<3
 selenium>=4.10
 PyQt5>=5.15
 QDarkStyle>=3.1
