@@ -13,6 +13,8 @@ The project is split into a testable core module (`web_scoping_core.py`) and a P
 - Check HTTP reachability with explicit timeouts and redirect handling.
 - Optionally run a simple WAF heuristic probe.
 - Reuse a single Selenium browser session for screenshots.
+- Keep the interface responsive with a background scan worker.
+- Show per-target progress and support cooperative cancellation.
 - Generate an escaped HTML report.
 - Open the report using the platform default browser without shell execution.
 - Optional voice notifications.
@@ -90,6 +92,7 @@ The tests exercise browser-independent behavior including:
 - WAF response interpretation
 - safe filename generation
 - HTML escaping in generated reports
+- scan orchestration, progress callbacks, cancellation, and screenshot failures
 
 The tests do not make live network requests.
 
@@ -122,10 +125,11 @@ The original project was a useful single-file prototype. The current version add
 - typed result objects
 - automated unit tests
 - linting and CI
+- background execution with observable progress and cooperative cancellation
 
 ## Known Limitations
 
-- The PyQt scan loop is still synchronous, so large target lists can temporarily block the UI. A production version should move work to worker threads or an async/background task layer.
+- Cancellation is cooperative: an in-flight HTTP request or browser operation completes before the worker stops. Explicit timeouts keep this delay bounded for HTTP calls.
 - The WAF check is heuristic and does not identify specific WAF vendors.
 - Screenshot behavior still depends on a compatible local Chrome/Chromium installation.
 - HTTP reachability is intentionally simple and is not a full application-health assessment.
