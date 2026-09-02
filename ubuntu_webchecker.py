@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from functools import partial
 from pathlib import Path
 from threading import Event
 
@@ -25,6 +26,9 @@ from selenium.webdriver.chrome.options import Options
 
 from web_scoping_core import (
     CheckResult,
+    build_http_session,
+    check_waf,
+    check_website_status,
     generate_html_report,
     normalize_url,
     open_report,
@@ -56,6 +60,7 @@ class ScanWorker(QObject):
     @pyqtSlot()
     def run(self) -> None:
         browser: webdriver.Chrome | None = None
+        http_session = build_http_session()
 
         def take_screenshot(url: str) -> str:
             nonlocal browser
@@ -71,6 +76,8 @@ class ScanWorker(QObject):
                 self.urls,
                 waf_check_enabled=self.waf_check_enabled,
                 take_screenshot=take_screenshot,
+                status_checker=partial(check_website_status, client=http_session),
+                waf_checker=partial(check_waf, client=http_session),
                 should_cancel=self._cancel_requested.is_set,
                 on_progress=report_progress,
             )
@@ -80,6 +87,7 @@ class ScanWorker(QObject):
         finally:
             if browser is not None:
                 browser.quit()
+            http_session.close()
 
 
 class WebScopingApp(QWidget):
