@@ -9,6 +9,7 @@ from __future__ import annotations
 import html
 import re
 import webbrowser
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -41,6 +42,20 @@ class CheckResult:
     screenshot_path: str | None
     waf_result: str
     error: str | None = None
+
+
+@dataclass(frozen=True)
+class ScanOutcome:
+    """Results from a scan, including whether it ended early by cancellation."""
+
+    results: list[CheckResult]
+    cancelled: bool
+
+
+StatusChecker = Callable[[str], tuple[bool, int | None, str | None]]
+WafChecker = Callable[[str], str]
+ScreenshotTaker = Callable[[str], str]
+ProgressCallback = Callable[[int, int, CheckResult], None]
 
 
 def normalize_url(value: str) -> str:
@@ -134,6 +149,60 @@ def url_to_filename(url: str, *, max_length: int = 120) -> str:
     """Convert a URL to a filesystem-friendly deterministic filename stem."""
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", url).strip("._")
     return (cleaned or "site")[:max_length]
+
+
+def scan_urls(
+    urls: Sequence[str],
+    *,
+    waf_check_enabled: bool,
+    take_screenshot: ScreenshotTaker,
+    status_checker: StatusChecker = check_website_status,
+    waf_checker: WafChecker = check_waf,
+    should_cancel: Callable[[], bool] = lambda: False,
+    on_progress: ProgressCallback | None = None,
+) -> ScanOutcome:
+    """Scan URLs sequentially with observable progress and cooperative cancellation.
+
+    Dependencies are injected so orchestration can be tested without network or browser
+    access. Cancellation is checked between expensive stages; an in-flight network or
+    browser operation is allowed to finish before the scan stops.
+    """
+    results: list[CheckResult] = []
+    total = len(urls)
+
+    for url in urls:
+        if should_cancel():
+            return ScanOutcome(results=results, cancelled=True)
+
+        is_up, status_code, error = status_checker(url)
+        if should_cancel():
+            return ScanOutcome(results=results, cancelled=True)
+
+        waf_result = waf_checker(url) if waf_check_enabled else "WAF check disabled."
+        if should_cancel():
+            return ScanOutcome(results=results, cancelled=True)
+
+        screenshot_path: str | None = None
+        if is_up:
+            try:
+                screenshot_path = take_screenshot(url)
+            except Exception as exc:
+                screenshot_error = f"Screenshot failed: {exc}"
+                error = f"{error}; {screenshot_error}" if error else screenshot_error
+
+        result = CheckResult(
+            url=url,
+            is_up=is_up,
+            status_code=status_code,
+            screenshot_path=screenshot_path,
+            waf_result=waf_result,
+            error=error,
+        )
+        results.append(result)
+        if on_progress is not None:
+            on_progress(len(results), total, result)
+
+    return ScanOutcome(results=results, cancelled=False)
 
 
 def generate_html_report(results: list[CheckResult], output_file: str | Path) -> Path:
