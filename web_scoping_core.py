@@ -16,8 +16,13 @@ from typing import Any, Protocol
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 DEFAULT_TIMEOUT_SECONDS = 10
+DEFAULT_MAX_RETRIES = 2
+DEFAULT_BACKOFF_FACTOR = 0.5
+RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -56,6 +61,36 @@ StatusChecker = Callable[[str], tuple[bool, int | None, str | None]]
 WafChecker = Callable[[str], str]
 ScreenshotTaker = Callable[[str], str]
 ProgressCallback = Callable[[int, int, CheckResult], None]
+
+
+def build_http_session(
+    *,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    backoff_factor: float = DEFAULT_BACKOFF_FACTOR,
+) -> requests.Session:
+    """Create a pooled session with bounded retries for transient GET failures."""
+    if max_retries < 0:
+        raise ValueError("max_retries cannot be negative")
+    if backoff_factor < 0:
+        raise ValueError("backoff_factor cannot be negative")
+
+    retry_policy = Retry(
+        total=max_retries,
+        connect=max_retries,
+        read=max_retries,
+        status=max_retries,
+        allowed_methods=frozenset({"GET"}),
+        status_forcelist=RETRYABLE_STATUS_CODES,
+        backoff_factor=backoff_factor,
+        respect_retry_after_header=True,
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry_policy)
+    session = requests.Session()
+    session.headers.update({"User-Agent": DEFAULT_USER_AGENT})
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
 
 
 def normalize_url(value: str) -> str:
@@ -155,7 +190,7 @@ def scan_urls(
     urls: Sequence[str],
     *,
     waf_check_enabled: bool,
-    take_screenshot: ScreenshotTaker,
+    take_screenshot: ScreenshotTaker | None = None,
     status_checker: StatusChecker = check_website_status,
     waf_checker: WafChecker = check_waf,
     should_cancel: Callable[[], bool] = lambda: False,
@@ -183,7 +218,7 @@ def scan_urls(
             return ScanOutcome(results=results, cancelled=True)
 
         screenshot_path: str | None = None
-        if is_up:
+        if is_up and take_screenshot is not None:
             try:
                 screenshot_path = take_screenshot(url)
             except Exception as exc:
