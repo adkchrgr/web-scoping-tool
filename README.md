@@ -11,6 +11,7 @@ The project is split into a testable core module (`web_scoping_core.py`) and a P
 - Enter a single URL or load multiple URLs from a text file.
 - Normalize bare hostnames to HTTPS.
 - Check HTTP reachability with explicit timeouts and redirect handling.
+- Reuse pooled HTTP connections with bounded retries and backoff for transient failures.
 - Optionally run a simple WAF heuristic probe.
 - Reuse a single Selenium browser session for screenshots.
 - Keep the interface responsive with a background scan worker.
@@ -18,6 +19,7 @@ The project is split into a testable core module (`web_scoping_core.py`) and a P
 - Generate an escaped HTML report.
 - Open the report using the platform default browser without shell execution.
 - Optional voice notifications.
+- Run headlessly with machine-readable JSON and meaningful exit codes.
 
 > **Authorized use only:** Run active checks only against systems you own or have explicit permission to test.
 
@@ -51,6 +53,8 @@ Modern Selenium versions can use Selenium Manager to locate or provision a compa
 
 ## Usage
 
+### Desktop interface
+
 ```bash
 python ubuntu_webchecker.py
 ```
@@ -62,6 +66,28 @@ Enter either:
 - a text file containing one target per line
 
 The generated report is written to `web_check_report.html`, and screenshots are stored under `screenshots/`.
+
+### Command-line interface
+
+The CLI performs HTTP checks without launching PyQt or Chrome:
+
+```bash
+python web_scoping_cli.py example.com https://example.org --waf
+```
+
+Targets can also be read from a file and results written to disk:
+
+```bash
+python web_scoping_cli.py --input-file targets.txt --output results.json
+```
+
+Exit codes are suitable for scripts and CI:
+
+- `0`: every target returned a healthy `2xx` or `3xx` response
+- `1`: the scan completed, but at least one target was unreachable or returned `4xx`/`5xx`
+- `2`: invalid input, configuration, or file/output error
+
+Use `--help` to see timeout, retry, and backoff controls.
 
 ## WAF Check
 
@@ -87,12 +113,14 @@ The tests exercise browser-independent behavior including:
 
 - URL normalization
 - request timeouts and network failures
+- pooled-session retry configuration
 - redirect handling
 - WAF probe URL construction
 - WAF response interpretation
 - safe filename generation
 - HTML escaping in generated reports
 - scan orchestration, progress callbacks, cancellation, and screenshot failures
+- CLI JSON output, session reuse, and exit-code behavior
 
 The tests do not make live network requests.
 
@@ -126,10 +154,13 @@ The original project was a useful single-file prototype. The current version add
 - automated unit tests
 - linting and CI
 - background execution with observable progress and cooperative cancellation
+- pooled HTTP sessions with bounded transient retries and `Retry-After` support
+- a headless JSON CLI with automation-friendly exit codes
 
 ## Known Limitations
 
 - Cancellation is cooperative: an in-flight HTTP request or browser operation completes before the worker stops. Explicit timeouts keep this delay bounded for HTTP calls.
+- Retries improve resilience but can extend an individual operation up to the configured retry and timeout bounds.
 - The WAF check is heuristic and does not identify specific WAF vendors.
 - Screenshot behavior still depends on a compatible local Chrome/Chromium installation.
 - HTTP reachability is intentionally simple and is not a full application-health assessment.
